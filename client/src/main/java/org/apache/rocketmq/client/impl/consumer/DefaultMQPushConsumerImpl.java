@@ -77,6 +77,7 @@ import org.apache.rocketmq.remoting.common.RemotingHelper;
 import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.apache.rocketmq.remoting.protocol.NamespaceUtil;
 import org.apache.rocketmq.remoting.protocol.ResponseCode;
+import org.apache.rocketmq.remoting.protocol.admin.ConsumeStats;
 import org.apache.rocketmq.remoting.protocol.body.ConsumeStatus;
 import org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo;
 import org.apache.rocketmq.remoting.protocol.body.PopProcessQueueInfo;
@@ -142,6 +143,8 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
     // only for test purpose, will be modified by reflection in unit test.
     @SuppressWarnings("FieldMayBeFinal")
     private static boolean doNotUpdateTopicSubscribeInfoWhenSubscriptionChanged = false;
+
+    private long timeoutMillis = 20000;
 
     public DefaultMQPushConsumerImpl(DefaultMQPushConsumer defaultMQPushConsumer, RPCHook rpcHook) {
         this.defaultMQPushConsumer = defaultMQPushConsumer;
@@ -923,8 +926,9 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
                 if (this.defaultMQPushConsumer.getMessageModel() == MessageModel.CLUSTERING) {
                     this.defaultMQPushConsumer.changeInstanceNameToPID();
                 }
-
-                this.mQClientFactory = MQClientManager.getInstance().getOrCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
+                if(this.mQClientFactory==null) {
+                    this.mQClientFactory = MQClientManager.getInstance().getOrCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
+                }
 
                 this.rebalanceImpl.setConsumerGroup(this.defaultMQPushConsumer.getConsumerGroup());
                 this.rebalanceImpl.setMessageModel(this.defaultMQPushConsumer.getMessageModel());
@@ -1256,6 +1260,49 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
             throw new MQClientException("subscription exception", e);
         }
     }
+
+    public void subscribeIdentical(String topic, String subExpression) throws MQClientException {
+        try {
+            if (this.mQClientFactory == null) {
+                this.mQClientFactory = MQClientManager.getInstance().getOrCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
+                this.mQClientFactory.getMQClientAPIImpl().start();
+            }
+            SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(topic, subExpression);
+            // if sub not identical put exception
+            String consumerGroup = this.defaultMQPushConsumer.getConsumerGroup();
+            if (StringUtils.isBlank(topic)) {
+                throw new Exception("Topic [" + topic + "] is null");
+            }
+
+            TopicRouteData topicRouteData = this.mQClientFactory.getMQClientAPIImpl().getTopicRouteInfoFromNameServer(topic, timeoutMillis);
+            if (topicRouteData == null) {
+                throw new Exception("not fount topic [" + topic + "]");
+            }
+            // select first broker get consumer stats and Subscription
+            String addr = topicRouteData.getBrokerDatas().get(0).selectBrokerAddr();
+            ConsumeStats consumeStats = this.mQClientFactory.getMQClientAPIImpl().getConsumeStats(addr, consumerGroup, timeoutMillis);
+            Set<String> topics = new HashSet<>();
+            for (MessageQueue messageQueue : consumeStats.getOffsetTable().keySet()) {
+                topics.add(messageQueue.getTopic());
+            }
+            // if topics not empty check topic and sub
+            if (!topics.isEmpty()) {
+                if (topics.size() == 1 && topics.contains(topic)) {
+                    SubscriptionData groupSubscriptionData = this.mQClientFactory.getMQClientAPIImpl().querySubscriptionByConsumer(addr, consumerGroup, topic, timeoutMillis);
+                    if (!groupSubscriptionData.equals(subscriptionData)) {
+                        throw new Exception("subscription not identical");
+                    }
+                }
+            }
+            this.rebalanceImpl.getSubscriptionInner().put(topic, subscriptionData);
+            if (this.mQClientFactory != null) {
+                this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();
+            }
+        } catch (Exception e) {
+            throw new MQClientException("subscription exception", e);
+        }
+    }
+
 
     public void subscribe(String topic, String fullClassName, String filterClassSource) throws MQClientException {
         try {
